@@ -11,7 +11,7 @@
  *   2. 查询并打印芯片固件版本及硬件信息
  *   3. 配置降压稳压器 (BUCK1 / BUCK2) 输出电压（附板级供电安全说明）
  *   4. 配置低压降稳压器 / 负载开关 (LDSW1) 为 3.3V LDO 供电模式
- *   5. 配置智能锂电池线性充电器（设置恒流充电电流为 200mA 并启用充电与 NTC 温度保护）
+ *   5. 配置智能锂电池线性充电器（设置恒流充电电流、终止电压，适配无 NTC / 两线电池场景）
  *   6. 配置 PMIC 状态指示 LED（硬件自动联动充电状态）
  *   7. 订阅 PMIC 硬件中断事件（VBUS 插入/拔出、电池接入/移除、充电完成/告警）
  *   8. 启动 FreeRTOS 周期监控任务，周期性采样电池电压 (VBAT)、系统电压 (VSYS)、内部结温及充电状态
@@ -136,7 +136,8 @@ static void setup_charger(npmx_instance_t *pmic)
 {
     ESP_LOGI(TAG, "正在配置锂电池充电器...");
     npmx_charger_t *charger = npmx_charger_get(pmic, 0);
-    if (charger == NULL) {
+    npmx_adc_t *adc = npmx_adc_get(pmic, 0);
+    if (charger == NULL || adc == NULL) {
         return;
     }
 
@@ -147,22 +148,54 @@ static void setup_charger(npmx_instance_t *pmic)
         return;
     }
 
-    /* 配置恒流充电电流为 200 mA (200000 uA) */
-    err = npmx_charger_charging_current_set(charger, 200000);
+    /* 1. 配置恒流充电电流 */
+    err = npmx_charger_charging_current_set(charger, NPMX_ESP32_CHARGING_CURRENT_UA);
     if (err != NPMX_SUCCESS) {
         ESP_LOGE(TAG, "设置恒流充电电流失败: %s", npmx_esp32_error_to_str(err));
         return;
     }
 
-    /* 重新使能充电功能、自动复充及 NTC 电池温度极限保护 */
+    /* 2. 配置充电截止/终止电压（常规单节锂电池为 4200 mV） */
+    err = npmx_charger_termination_normal_voltage_set(
+        charger, npmx_charger_voltage_convert(NPMX_ESP32_TERMINATION_VOLTAGE_MV));
+    if (err != NPMX_SUCCESS) {
+        ESP_LOGE(TAG, "设置充电终止电压失败: %s", npmx_esp32_error_to_str(err));
+        return;
+    }
+
+    /* 3. NTC 温度监控配置（核心重点：适配未接电池或两线电池场景） */
+#if NPMX_ESP32_BATTERY_HAS_NTC
+    /* 三线电池：开启 NTC 温度监控 (10k NTC, beta=3380) */
+    npmx_adc_ntc_config_t ntc_config = {
+        .type = NPMX_ADC_NTC_TYPE_10_K,
+        .beta = 3380U,
+    };
+    npmx_adc_ntc_config_set(adc, &ntc_config);
     err = npmx_charger_module_enable_set(charger,
                                          NPMX_CHARGER_MODULE_CHARGER_MASK |
                                          NPMX_CHARGER_MODULE_RECHARGE_MASK |
                                          NPMX_CHARGER_MODULE_NTC_LIMITS_MASK);
+    ESP_LOGI(TAG, "NTC 温度保护已启用 (10k, beta=3380)");
+#else
+    /* 两线电池或未接电池：将 NTC 引脚设为高阻态并关闭 NTC 限制，防止悬空引脚导致充电被误锁死 */
+    npmx_adc_ntc_config_t ntc_config = {
+        .type = NPMX_ADC_NTC_TYPE_HI_Z,
+        .beta = 0U,
+    };
+    npmx_adc_ntc_config_set(adc, &ntc_config);
+    npmx_charger_module_disable_set(charger, NPMX_CHARGER_MODULE_NTC_LIMITS_MASK);
+
+    err = npmx_charger_module_enable_set(charger,
+                                         NPMX_CHARGER_MODULE_CHARGER_MASK |
+                                         NPMX_CHARGER_MODULE_RECHARGE_MASK);
+    ESP_LOGI(TAG, "两线电池/未接电池环境：NTC 引脚已设为高阻态，NTC 温度防护已关闭");
+#endif
+
     if (err == NPMX_SUCCESS) {
         uint32_t current_ua = 0;
         npmx_charger_charging_current_get(charger, &current_ua);
-        ESP_LOGI(TAG, "充电器使能成功！当前设定充电电流: %" PRIu32 " mA", current_ua / 1000);
+        ESP_LOGI(TAG, "充电器使能成功！设定恒流电流: %" PRIu32 " mA，终止电压: %d mV",
+                 current_ua / 1000, NPMX_ESP32_TERMINATION_VOLTAGE_MV);
     } else {
         ESP_LOGE(TAG, "重新启用充电器模块失败: %s", npmx_esp32_error_to_str(err));
     }
@@ -265,11 +298,12 @@ static void pmic_monitor_task(void *arg)
         }
 
         if (err_chg == NPMX_SUCCESS) {
-            ESP_LOGI(TAG, " [充电器状态码]   : 0x%02X (%s%s%s)",
+            ESP_LOGI(TAG, " [充电器状态码]   : 0x%02X (%s%s%s%s)",
                      chg_status,
                      (chg_status & NPMX_CHARGER_STATUS_BATTERY_DETECTED_MASK) ? "电池已接入 " : "无电池 ",
+                     (chg_status & NPMX_CHARGER_STATUS_TRICKLE_CHARGE_MASK)   ? "涓流充电中 " : "",
                      (chg_status & NPMX_CHARGER_STATUS_CONSTANT_CURRENT_MASK) ? "恒流充电中 " : "",
-                     (chg_status & NPMX_CHARGER_STATUS_COMPLETED_MASK)        ? "充电已完成" : "未在充电");
+                     (chg_status & NPMX_CHARGER_STATUS_COMPLETED_MASK)        ? "充电已完成" : "空闲/未在充电");
         }
         ESP_LOGI(TAG, "--------------------------------------------------------");
     }
